@@ -1,0 +1,13 @@
+# Source-only repository inside a local Unity project.
+/*
+!/.gitignore
+!/README.md
+!/Assets/
+/Assets/*
+!/Assets/MSM.meta
+!/Assets/MSM/
+/Assets/MSM/*
+!/Assets/MSM/MsmRendererFeature.cs
+!/Assets/MSM/MsmRendererFeature.cs.meta
+!/Assets/MSM/ShadowMoments.compute
+!/Assets/MSM/ShadowMoments.compute.meta

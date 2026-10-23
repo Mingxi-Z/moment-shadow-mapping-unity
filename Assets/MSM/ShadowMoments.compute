@@ -1,0 +1,394 @@
+#pragma kernel CSMain
+#pragma kernel BuildTileSummaries
+#pragma kernel CompleteTileColumns
+#pragma kernel CompleteTileRows
+#pragma kernel BuildTileSAT
+#pragma kernel CSResolveShadows
+#pragma kernel CSBenchmarkVisibility
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+
+Texture2D<float> _ShadowDepth;
+float4x4 _CameraInverseVP;
+RWTexture2D<uint4> _MomentsOutput;
+Texture2D<uint4> _SATInput;
+RWTexture2D<float> _ShadowVisibility;
+RWTexture2D<uint4> _TileOutput;
+RWTexture2D<uint4> _TileRowsOutput;
+RWTexture2D<uint4> _TileColumnsOutput;
+Texture2D<uint4> _TileRowsInput;
+Texture2D<uint4> _TileColumnsInput;
+RWTexture2D<uint4> _TileTotalsOutput;
+Texture2D<uint4> _TileTotalsInput;
+
+#define SAT_TILE_SIZE 16
+#define SAT_BOUNDARY_BATCH 8
+groupshared uint4 tileShared[SAT_TILE_SIZE * SAT_TILE_SIZE];
+groupshared uint4 tileBoundaryShared[SAT_BOUNDARY_BATCH * SAT_TILE_SIZE];
+groupshared uint4 tileLeftShared[SAT_TILE_SIZE];
+
+static const uint MAX_SAT_QUERY_TEXELS = 256u;
+static const float MOMENT_QUANTIZATION_SCALE = float(0xffffffffu / MAX_SAT_QUERY_TEXELS);
+
+float4 EncodeMoments(float z)
+{
+    float z2 = z * z;
+    float4 moments = float4(z, z2, z2 * z, z2 * z2);
+    return saturate(moments * 0.5 + 0.5);
+}
+
+uint4 LoadQuantizedMoments(uint2 pixel)
+{
+    float z = _ShadowDepth.Load(int3(pixel, 0));
+    #if UNITY_REVERSED_Z
+    z = 1.0 - z;
+    #endif
+    z = z * 2.0 - 1.0;
+    return uint4(round(EncodeMoments(z) * MOMENT_QUANTIZATION_SCALE));
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _MomentsOutput.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height)
+        return;
+
+    _MomentsOutput[id.xy] = LoadQuantizedMoments(id.xy);
+}
+
+[numthreads(64, 1, 1)]
+void BuildTileSummaries(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint width, height;
+    _ShadowDepth.GetDimensions(width, height);
+    uint2 origin = group.xy * SAT_TILE_SIZE;
+    [unroll]
+    for (uint index = lane; index < SAT_TILE_SIZE * SAT_TILE_SIZE; index += 64)
+    {
+        uint2 pixel = origin + uint2(index % SAT_TILE_SIZE, index / SAT_TILE_SIZE);
+        uint4 value = 0;
+        if (pixel.x < width && pixel.y < height)
+            value = LoadQuantizedMoments(pixel);
+        tileShared[index] = value;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // S.1: local column tails and local 2D right edges.
+    if (lane < SAT_TILE_SIZE)
+    {
+        uint4 sum = 0;
+        [unroll]
+        for (uint yy = 0; yy < SAT_TILE_SIZE; ++yy)
+        {
+            uint ii = yy * SAT_TILE_SIZE + lane;
+            sum += tileShared[ii];
+            tileShared[ii] = sum;
+        }
+        uint x = origin.x + lane;
+        if (x < width)
+            _TileColumnsOutput[uint2(x, group.y)] = sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < SAT_TILE_SIZE && origin.y + lane < height)
+    {
+        uint4 sum = 0;
+        [unroll]
+        for (uint x = 0; x < SAT_TILE_SIZE; ++x)
+            sum += tileShared[lane * SAT_TILE_SIZE + x];
+        _TileRowsOutput[uint2(group.x, origin.y + lane)] = sum;
+    }
+}
+
+// S.2: one group per tile column, including zero lanes in partial tiles.
+[numthreads(SAT_TILE_SIZE, 1, 1)]
+void CompleteTileColumns(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint width, tileRows;
+    _TileColumnsOutput.GetDimensions(width, tileRows);
+    uint x = group.x * SAT_TILE_SIZE + lane;
+    uint4 carry = 0;
+    for (uint baseRow = 0; baseRow < tileRows; baseRow += SAT_BOUNDARY_BATCH)
+    {
+        [unroll]
+        for (uint k = 0; k < SAT_BOUNDARY_BATCH; ++k)
+        {
+            uint ty = baseRow + k;
+            if (x < width && ty < tileRows)
+            {
+                carry += _TileColumnsOutput[uint2(x, ty)];
+                _TileColumnsOutput[uint2(x, ty)] = carry;
+            }
+            tileBoundaryShared[k * SAT_TILE_SIZE + lane] = carry;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Each active lane reduces a different boundary in the batch.
+        if (lane < SAT_BOUNDARY_BATCH && baseRow + lane < tileRows)
+        {
+            uint4 total = 0;
+            [unroll]
+            for (uint i = 0; i < SAT_TILE_SIZE; ++i)
+                total += tileBoundaryShared[lane * SAT_TILE_SIZE + i];
+            _TileTotalsOutput[uint2(group.x, baseRow + lane)] = total;
+        }
+        // Finish all reductions before reusing the batch storage.
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// S.3: Eq.45 adds the above-strip total before carrying the right edge.
+[numthreads(64, 1, 1)]
+void CompleteTileRows(uint3 id : SV_DispatchThreadID)
+{
+    uint tileColumns, height;
+    _TileRowsOutput.GetDimensions(tileColumns, height);
+    uint y = id.x;
+    if (y >= height)
+        return;
+
+    uint ty = y / SAT_TILE_SIZE;
+    uint4 carry = 0;
+    for (uint tx = 0; tx < tileColumns; ++tx)
+    {
+        carry += _TileRowsOutput[uint2(tx, y)];
+        if (ty > 0)
+            carry += _TileTotalsInput.Load(int3(tx, ty - 1, 0));
+        _TileRowsOutput[uint2(tx, y)] = carry;
+    }
+}
+
+// S.4: top column tails plus the complete left edge cover disjoint regions.
+[numthreads(64, 1, 1)]
+void BuildTileSAT(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint width, height;
+    _ShadowDepth.GetDimensions(width, height);
+    uint2 origin = group.xy * SAT_TILE_SIZE;
+
+    [unroll]
+    for (uint index = lane; index < SAT_TILE_SIZE * SAT_TILE_SIZE; index += 64)
+    {
+        uint2 local = uint2(index % SAT_TILE_SIZE, index / SAT_TILE_SIZE);
+        uint2 pixel = origin + local;
+        uint4 value = 0;
+        if (pixel.x < width && pixel.y < height)
+        {
+            value = LoadQuantizedMoments(pixel);
+            if (local.y == 0 && group.y > 0)
+                value += _TileColumnsInput.Load(int3(pixel.x, group.y - 1, 0));
+        }
+        tileShared[index] = value;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < SAT_TILE_SIZE)
+    {
+        uint4 sum = 0;
+        [unroll]
+        for (uint x = 0; x < SAT_TILE_SIZE; ++x)
+        {
+            uint index = lane * SAT_TILE_SIZE + x;
+            sum += tileShared[index];
+            tileShared[index] = sum;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < SAT_TILE_SIZE)
+    {
+        uint4 sum = 0;
+        [unroll]
+        for (uint y = 0; y < SAT_TILE_SIZE; ++y)
+        {
+            uint index = y * SAT_TILE_SIZE + lane;
+            sum += tileShared[index];
+            tileShared[index] = sum;
+        }
+        uint4 left = 0;
+        if (group.x > 0 && origin.y + lane < height)
+            left = _TileRowsInput.Load(int3(group.x - 1, origin.y + lane, 0));
+        tileLeftShared[lane] = left;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint index = lane; index < SAT_TILE_SIZE * SAT_TILE_SIZE; index += 64)
+    {
+        uint2 pixel = origin + uint2(index % SAT_TILE_SIZE, index / SAT_TILE_SIZE);
+        if (pixel.x < width && pixel.y < height)
+        {
+            uint4 value = tileShared[index] + tileLeftShared[index / SAT_TILE_SIZE];
+            _TileOutput[pixel] = value;
+        }
+    }
+}
+
+float ComputeMSMHamburger(float4 moments, float fragmentDepth, float depthBias, float momentBias)
+{
+    float4 b = lerp(moments, float4(0.0, 0.375, 0.0, 0.375), momentBias);
+    float3 z;
+    z[0] = fragmentDepth - depthBias;
+
+    float L32D22 = mad(-b[0], b[1], b[2]);
+    float D22 = mad(-b[0], b[0], b[1]);
+    float squaredDepthVariance = mad(-b[1], b[1], b[3]);
+    float D33D22 = dot(float2(squaredDepthVariance, -L32D22), float2(D22, L32D22));
+    float InvD22 = 1.0f / D22;
+    float L32 = L32D22 * InvD22;
+
+    float3 c = float3(1.0f, z[0], z[0] * z[0]);
+    c[1] -= b.x;
+    c[2] -= b.y + L32 * c[1];
+    c[1] *= InvD22;
+    c[2] *= D22 / D33D22;
+    c[1] -= L32 * c[2];
+    c[0] -= dot(c.yz, b.xy);
+
+    float p = c[1] / c[2];
+    float q = c[0] / c[2];
+    float D = (p * p * 0.25f) - q;
+    float r = sqrt(D);
+    z[1] = -p * 0.5f - r;
+    z[2] = -p * 0.5f + r;
+
+    float4 switchVal = (z[2] < z[0]) ? float4(z[1], z[0], 1.0f, 1.0f) :
+                      ((z[1] < z[0]) ? float4(z[0], z[1], 0.0f, 1.0f) :
+                      float4(0.0f, 0.0f, 0.0f, 0.0f));
+    float quotient = (switchVal[0] * z[2] - b[0] * (switchVal[0] + z[2]) + b[1])
+                   / ((z[2] - switchVal[1]) * (z[0] - z[1]));
+    float shadowIntensity = switchVal[2] + switchVal[3] * quotient;
+    return 1.0f - saturate(shadowIntensity);
+}
+
+uint4 LoadSATPrefix(int2 pixel)
+{
+    uint4 result = uint4(0, 0, 0, 0);
+    if (pixel.x >= 0 && pixel.y >= 0)
+        result = _SATInput.Load(int3(pixel, 0));
+    return result;
+}
+
+void SplitSATInterval(float lo, float hi, out int4 boundaries, out float3 weights)
+{
+    boundaries = int4(0, 0, 0, 0);
+    weights = float3(0.0, 0.0, 0.0);
+
+    int first = int(floor(lo));
+    int last = int(floor(hi));
+    if (first == last)
+    {
+        boundaries = int4(first, first + 1, first + 1, first + 1);
+        weights = float3(hi - lo, 0.0, 0.0);
+        return;
+    }
+
+    boundaries = int4(first, int(ceil(lo)), last, int(ceil(hi)));
+    weights = float3(ceil(lo) - lo, 1.0, hi - floor(hi));
+}
+
+float4 IntegrateSATRectangle(float2 lo, float2 hi)
+{
+    int4 xs, ys;
+    float3 wx, wy;
+    SplitSATInterval(lo.x, hi.x, xs, wx);
+    SplitSATInterval(lo.y, hi.y, ys, wy);
+
+    uint4 previousRow[4];
+    [unroll]
+    for (int rx = 0; rx < 4; ++rx)
+        previousRow[rx] = LoadSATPrefix(int2(xs[rx] - 1, ys[0] - 1));
+
+    float4 integral = 0.0;
+    [unroll]
+    for (int iy = 0; iy < 3; ++iy)
+    {
+        uint4 currentRow[4];
+        [unroll]
+        for (int rx = 0; rx < 4; ++rx)
+            currentRow[rx] = LoadSATPrefix(int2(xs[rx] - 1, ys[iy + 1] - 1));
+
+        [unroll]
+        for (int ix = 0; ix < 3; ++ix)
+        {
+            uint4 sum = currentRow[ix + 1];
+            sum -= currentRow[ix];
+            sum -= previousRow[ix + 1];
+            sum += previousRow[ix];
+            integral += float4(sum) * (wx[ix] * wy[iy]);
+        }
+
+        [unroll]
+        for (int rx = 0; rx < 4; ++rx)
+            previousRow[rx] = currentRow[rx];
+    }
+    return integral;
+}
+
+[numthreads(8, 8, 1)]
+void CSResolveShadows(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _ShadowVisibility.GetDimensions(width, height);
+
+    if (id.x >= width || id.y >= height)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float deviceDepth = LoadSceneDepth(pixel);
+    if (deviceDepth == UNITY_RAW_FAR_CLIP_VALUE)
+    {
+        _ShadowVisibility[id.xy] = 1.0;
+        return;
+    }
+
+    float2 uv = (float2(pixel) + 0.5) / float2(width, height);
+    float3 worldPosition = ComputeWorldSpacePosition(uv, deviceDepth, _CameraInverseVP);
+    float4 shadowCoord = TransformWorldToShadowCoord(worldPosition);
+
+    float depth = shadowCoord.z;
+    #if UNITY_REVERSED_Z
+    depth = 1.0 - depth;
+    #endif
+    depth = depth * 2.0 - 1.0;
+
+    uint shadowWidth, shadowHeight;
+    _SATInput.GetDimensions(shadowWidth, shadowHeight);
+
+    float2 texelPosition = shadowCoord.xy * float2(shadowWidth, shadowHeight);
+    float2 atlasSize = float2(shadowWidth, shadowHeight);
+    float2 lo = clamp(texelPosition - 4.0, float2(0.0, 0.0), atlasSize);
+    float2 hi = clamp(texelPosition + 4.0, float2(0.0, 0.0), atlasSize);
+    float2 extent = hi - lo;
+    float area = extent.x * extent.y;
+    if (area <= 0.0)
+    {
+        _ShadowVisibility[id.xy] = 1.0;
+        return;
+    }
+
+    float4 integral = IntegrateSATRectangle(lo, hi);
+    float4 filteredMoments = integral / MOMENT_QUANTIZATION_SCALE / area;
+    filteredMoments = filteredMoments * 2.0 - 1.0;
+
+    static const float momentBias = 3e-5;
+    static const float depthBias = 1e-4;
+
+    float value = ComputeMSMHamburger(filteredMoments, depth, depthBias, momentBias);
+    _ShadowVisibility[id.xy] = value;
+}
+
+[numthreads(8, 8, 1)]
+void CSBenchmarkVisibility(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _ShadowVisibility.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height)
+        return;
+
+    _ShadowVisibility[id.xy] = 0.5;
+}
