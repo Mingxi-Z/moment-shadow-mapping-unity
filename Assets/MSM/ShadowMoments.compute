@@ -5,6 +5,7 @@
 #pragma kernel BuildTileSAT
 #pragma kernel CSResolveShadows
 #pragma kernel CSBenchmarkVisibility
+#pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
@@ -417,8 +418,24 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
 
     float2 texelPosition = shadowCoord.xy * float2(shadowWidth, shadowHeight);
     float2 atlasSize = float2(shadowWidth, shadowHeight);
-    float2 lo = clamp(texelPosition - BLOCKER_SEARCH_RADIUS_TEXELS, float2(0.0, 0.0), atlasSize);
-    float2 hi = clamp(texelPosition + BLOCKER_SEARCH_RADIUS_TEXELS, float2(0.0, 0.0), atlasSize);
+
+    #if defined(_MAIN_LIGHT_SHADOWS_CASCADE)
+        uint cascadeIndex = (uint)ComputeCascadeIndex(worldPosition);
+        float cascadeResolution = atlasSize.x * 0.5;
+        float2 cascadeSize = float2(cascadeResolution, cascadeResolution);
+
+        float2 cascadeCell = float2(cascadeIndex % 2, cascadeIndex / 2);
+
+        float2 cascadeMin = cascadeCell * cascadeSize;
+        float2 cascadeMax = cascadeMin + cascadeSize;
+    #else
+        uint cascadeIndex = 0;
+        float2 cascadeMin = float2(0.0, 0.0);
+        float2 cascadeMax = atlasSize;
+    #endif
+
+    float2 lo = clamp(texelPosition - BLOCKER_SEARCH_RADIUS_TEXELS, cascadeMin, cascadeMax);
+    float2 hi = clamp(texelPosition + BLOCKER_SEARCH_RADIUS_TEXELS, cascadeMin, cascadeMax);
     float2 extent = hi - lo;
     float area = extent.x * extent.y;
     if (area <= 0.0)
@@ -437,8 +454,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     // First query: estimate blocker depth.
     float averageBlockerDepth = EstimateAverageBlockerDepth(filteredMoments, depth, momentBias);
 
-    // shortcut: one orthographic cascade; revisit before supporting other lights.
-    float4x4 worldToShadow = _MainLightWorldToShadow[0];
+    float4x4 worldToShadow = _MainLightWorldToShadow[cascadeIndex];
 
     float depthPerWorldUnit = length(worldToShadow[2].xyz);
     float2 uvPerWorldUnit = float2(length(worldToShadow[0].xyz), length(worldToShadow[1].xyz));
@@ -451,8 +467,8 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     float2 filterRadius = worldRadius * uvPerWorldUnit * atlasSize;
 
     filterRadius = clamp(filterRadius, MIN_FILTER_RADIUS_TEXELS, MAX_FILTER_RADIUS_TEXELS);
-    lo = clamp(texelPosition - filterRadius, float2(0.0, 0.0), atlasSize);
-    hi = clamp(texelPosition + filterRadius, float2(0.0, 0.0), atlasSize);
+    lo = clamp(texelPosition - filterRadius, cascadeMin, cascadeMax);
+    hi = clamp(texelPosition + filterRadius, cascadeMin, cascadeMax);
     extent = hi - lo;
     area = extent.x * extent.y;
 

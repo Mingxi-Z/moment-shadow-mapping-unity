@@ -26,7 +26,7 @@ or import the source into an existing one. The current lab's untracked files are
 3. Assign `ShadowMoments.compute` to its Compute Shader field and select
    **Full MSM**.
 4. Start with a Forward/Forward+ renderer, one realtime directional light,
-   **one cascade**, and a simple opaque URP Lit receiver/caster setup.
+   one cascade initially, and a simple opaque URP Lit receiver/caster setup.
    The feature requests camera depth and restores the main-light shadow keywords
    before transparents.
 
@@ -63,8 +63,8 @@ SAT integration and R8 visibility. Moment bias is 3e-5; receiver depth bias is 1
 Shader constants currently use a 7.5-texel blocker-search radius, a filter-radius
 range of 0.5–7.5 texels, and an angular slope of 0.05 (tan of the emitter half-angle).
 The matrix row scales convert signed depth differences to world distances and
-world radii to atlas texels. This assumes one orthographic directional-light
-cascade. Increasing the angular slope simulates a larger light, not higher quality.
+world radii to atlas texels. This assumes orthographic directional-light
+projections. Increasing the angular slope simulates a larger light, not higher quality.
 Blocker estimation rejects non-finite nodes, near-zero weight denominators and
 non-finite averages by returning receiver depth, selecting minimum filtering.
 
@@ -84,8 +84,12 @@ contain more than one dispatch. No portable performance guarantee is claimed.
 
 ## Current limits and validation
 
-- Only the main directional light and a single-cascade atlas have been validated
-  in the lab workflow. Point/spot lights and cascade-isolated filtering are absent.
+- The main directional light supports cascade-aware sampling using URP's keyword,
+  split spheres and matrices. Both SAT queries are clipped to the selected slice
+  using the installed URP's 1–4 cascade atlas layout. Point/spot lights are absent.
+- Cascade selection switches directly between slices; transition blending is not
+  implemented. The learner reports a soft/hard discontinuity also seen with default
+  URP shadows. Its exact location has not been matched to cascade debug colors.
 - Basic contact hardening is implemented. The learner reports softer edges as a
   caster moves away from the receiver in the lab scene. This is a visual check,
   not validation across arbitrary depth distributions or scenes.
