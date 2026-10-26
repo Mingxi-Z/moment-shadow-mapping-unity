@@ -53,10 +53,20 @@ The quantization scale assumes each integer rectangle queried contains at most
 **256 texels**. Do not enlarge search/filter windows without revisiting this
 bound, including the integer rectangles used by fractional-coverage integration.
 
-Resolve reconstructs world position from camera depth, transforms to light shadow
-coordinates, integrates a fixed 8×8-texel window, decodes average moments and runs
-Hamburger MSM. It uses background early-out, streamed SAT integration and R8
-visibility. Moment bias is 3e-5; receiver depth bias is 1e-4.
+Resolve reconstructs world position from camera depth and transforms to light
+shadow coordinates. A first SAT query supplies moments for average blocker-depth
+estimation. The receiver/blocker gap determines a directional-light penumbra
+radius. A second query supplies filtered moments for Hamburger MSM visibility.
+Both queries reuse the same SAT. Resolve keeps background early-out, streamed
+SAT integration and R8 visibility. Moment bias is 3e-5; receiver depth bias is 1e-4.
+
+Shader constants currently use a 7.5-texel blocker-search radius, a filter-radius
+range of 0.5–7.5 texels, and an angular slope of 0.05 (tan of the emitter half-angle).
+The matrix row scales convert signed depth differences to world distances and
+world radii to atlas texels. This assumes one orthographic directional-light
+cascade. Increasing the angular slope simulates a larger light, not higher quality.
+Blocker estimation rejects non-finite nodes, near-zero weight denominators and
+non-finite averages by returning receiver depth, selecting minimum filtering.
 
 ## Benchmark modes
 
@@ -72,21 +82,29 @@ not isolate a pure SAT dispatch cost. Compare per-dispatch GPU timings with the
 same scene/settings and repeat baseline/variant/baseline. Encoder labels may
 contain more than one dispatch. No portable performance guarantee is claimed.
 
-## Current limits and next milestone
+## Current limits and validation
 
 - Only the main directional light and a single-cascade atlas have been validated
   in the lab workflow. Point/spot lights and cascade-isolated filtering are absent.
-- Filtering is fixed-width. Blocker-depth estimation and contact hardening are
-  **not implemented**.
+- Basic contact hardening is implemented. The learner reports softer edges as a
+  caster moves away from the receiver in the lab scene. This is a visual check,
+  not validation across arbitrary depth distributions or scenes.
+- Search/filter radii are capped for integer precision; large penumbrae are
+  truncated. The search is fixed in texels, not a general physical search bound.
+- The final Hamburger visibility reconstruction still has unguarded degenerate
+  divisions. Blocker fallbacks do not make every reconstruction numerically robust.
 - Transparent receivers retain URP's original shadow route.
 - Multi-camera/XR/portal rendering, mixed/baked-lighting parity, player-build
   shader stripping and complete shadow-distance/fade behavior are not validated.
 - The implementation depends on the installed URP shader/API conventions;
   re-check projection orientation and depth conventions when changing versions.
 
-Next: query search moments, reconstruct candidate blockers, estimate average
-blocker depth, derive a directional-light penumbra radius, and query the same SAT
-with that dynamic filter size. Keep queries within the integer precision bound.
+In the lab, increasing the angular slope exposed a gray outer contour. A fixed
+filter removed it; increasing the search radius from 4 to 7.5 also removed it with
+dynamic filtering restored. This supports insufficient search coverage as a
+contributor, not a universal proof that search radius equals maximum filter radius.
+Scene-view wheel zoom shows edge stepping in both this feature and default URP
+shadows; the exact screen-sampling/projection contribution remains unisolated.
 
 ## References
 

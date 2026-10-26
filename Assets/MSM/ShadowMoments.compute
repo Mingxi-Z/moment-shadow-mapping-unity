@@ -31,6 +31,11 @@ groupshared uint4 tileLeftShared[SAT_TILE_SIZE];
 
 static const uint MAX_SAT_QUERY_TEXELS = 256u;
 static const float MOMENT_QUANTIZATION_SCALE = float(0xffffffffu / MAX_SAT_QUERY_TEXELS);
+// Fractional windows touch at most 16x16 texels at this radius.
+static const float MAX_FILTER_RADIUS_TEXELS = 7.5;
+static const float BLOCKER_SEARCH_RADIUS_TEXELS = MAX_FILTER_RADIUS_TEXELS;
+static const float MIN_FILTER_RADIUS_TEXELS = 0.5;
+static const float LIGHT_ANGULAR_SLOPE = 0.05; // tan(emitter half-angle).
 
 float4 EncodeMoments(float z)
 {
@@ -228,11 +233,10 @@ void BuildTileSAT(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
     }
 }
 
-float ComputeMSMHamburger(float4 moments, float fragmentDepth, float depthBias, float momentBias)
+float3 ReconstructMomentDepths(float4 b, float receiverDepth)
 {
-    float4 b = lerp(moments, float4(0.0, 0.375, 0.0, 0.375), momentBias);
     float3 z;
-    z[0] = fragmentDepth - depthBias;
+    z[0] = receiverDepth;
 
     float L32D22 = mad(-b[0], b[1], b[2]);
     float D22 = mad(-b[0], b[0], b[1]);
@@ -256,6 +260,14 @@ float ComputeMSMHamburger(float4 moments, float fragmentDepth, float depthBias, 
     z[1] = -p * 0.5f - r;
     z[2] = -p * 0.5f + r;
 
+    return z;
+}
+
+float ComputeMSMHamburger(float4 moments, float fragmentDepth, float depthBias, float momentBias)
+{
+    float4 b = lerp(moments, float4(0.0, 0.375, 0.0, 0.375), momentBias);
+    float3 z = ReconstructMomentDepths(b, fragmentDepth - depthBias);
+
     float4 switchVal = (z[2] < z[0]) ? float4(z[1], z[0], 1.0f, 1.0f) :
                       ((z[1] < z[0]) ? float4(z[0], z[1], 0.0f, 1.0f) :
                       float4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -263,6 +275,50 @@ float ComputeMSMHamburger(float4 moments, float fragmentDepth, float depthBias, 
                    / ((z[2] - switchVal[1]) * (z[0] - z[1]));
     float shadowIntensity = switchVal[2] + switchVal[3] * quotient;
     return 1.0f - saturate(shadowIntensity);
+}
+
+float EstimateAverageBlockerDepth(float4 moments, float receiverDepth, float momentBias)
+{
+    float4 b = lerp(moments, float4(0.0, 0.375, 0.0, 0.375), momentBias);
+    float3 z = ReconstructMomentDepths(b, receiverDepth);
+
+    if (!all(isfinite(z)))
+    {
+        return receiverDepth;
+    }
+
+    float denominator1 = (z.y - z.x) * (z.y - z.z);
+    float denominator2 = (z.z - z.x) * (z.z - z.y);
+
+    if (abs(denominator1) < 1e-6 || abs(denominator2) < 1e-6)
+    {
+        return receiverDepth;
+    }
+
+    float w1 = (b.y - b.x * (z.x + z.z) + z.x * z.z) / denominator1;
+    float w2 = (b.y - b.x * (z.x + z.y) + z.x * z.y) / denominator2;
+
+    const float blockerEpsilon = 1e-3;
+    float weightedDepth = blockerEpsilon * receiverDepth;
+    float blockerWeight = blockerEpsilon;
+
+    if (z.y < z.x)
+    {
+        weightedDepth += w1 * z.y;
+        blockerWeight += w1;
+    }
+
+    if (z.z < z.x)
+    {
+        weightedDepth += w2 * z.z;
+        blockerWeight += w2;
+    }
+
+    float averageDepth = weightedDepth / blockerWeight;
+    if (!isfinite(averageDepth))
+        return receiverDepth;
+
+    return averageDepth;
 }
 
 uint4 LoadSATPrefix(int2 pixel)
@@ -361,8 +417,8 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
 
     float2 texelPosition = shadowCoord.xy * float2(shadowWidth, shadowHeight);
     float2 atlasSize = float2(shadowWidth, shadowHeight);
-    float2 lo = clamp(texelPosition - 4.0, float2(0.0, 0.0), atlasSize);
-    float2 hi = clamp(texelPosition + 4.0, float2(0.0, 0.0), atlasSize);
+    float2 lo = clamp(texelPosition - BLOCKER_SEARCH_RADIUS_TEXELS, float2(0.0, 0.0), atlasSize);
+    float2 hi = clamp(texelPosition + BLOCKER_SEARCH_RADIUS_TEXELS, float2(0.0, 0.0), atlasSize);
     float2 extent = hi - lo;
     float area = extent.x * extent.y;
     if (area <= 0.0)
@@ -378,8 +434,40 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     static const float momentBias = 3e-5;
     static const float depthBias = 1e-4;
 
-    float value = ComputeMSMHamburger(filteredMoments, depth, depthBias, momentBias);
-    _ShadowVisibility[id.xy] = value;
+    // First query: estimate blocker depth.
+    float averageBlockerDepth = EstimateAverageBlockerDepth(filteredMoments, depth, momentBias);
+
+    // shortcut: one orthographic cascade; revisit before supporting other lights.
+    float4x4 worldToShadow = _MainLightWorldToShadow[0];
+
+    float depthPerWorldUnit = length(worldToShadow[2].xyz);
+    float2 uvPerWorldUnit = float2(length(worldToShadow[0].xyz), length(worldToShadow[1].xyz));
+
+    float signedDepthGap = max(depth - averageBlockerDepth, 0.0);
+    // Moments use [-1,1]; the shadow matrix depth uses [0,1].
+    float worldGap = signedDepthGap / (2.0 * depthPerWorldUnit);
+
+    float worldRadius = worldGap * LIGHT_ANGULAR_SLOPE;
+    float2 filterRadius = worldRadius * uvPerWorldUnit * atlasSize;
+
+    filterRadius = clamp(filterRadius, MIN_FILTER_RADIUS_TEXELS, MAX_FILTER_RADIUS_TEXELS);
+    lo = clamp(texelPosition - filterRadius, float2(0.0, 0.0), atlasSize);
+    hi = clamp(texelPosition + filterRadius, float2(0.0, 0.0), atlasSize);
+    extent = hi - lo;
+    area = extent.x * extent.y;
+
+    if (area <= 0.0)
+    {
+        _ShadowVisibility[id.xy] = 1.0;
+        return;
+    }
+
+    integral = IntegrateSATRectangle(lo, hi);
+    filteredMoments = integral / MOMENT_QUANTIZATION_SCALE / area;
+    filteredMoments = filteredMoments * 2.0 - 1.0;
+
+    float visibility = ComputeMSMHamburger(filteredMoments, depth, depthBias, momentBias);
+    _ShadowVisibility[id.xy] = visibility;
 }
 
 [numthreads(8, 8, 1)]
