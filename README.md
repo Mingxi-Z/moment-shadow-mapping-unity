@@ -122,6 +122,7 @@ standard shadow path.
 | --- | --- |
 | [ContactHardening](Assets/MSMExamples/Scenes/ContactHardening.unity) | A vertically animated sphere and grounded reference cube for inspecting the relationship between separation and shadow softness. |
 | [LayeredBlockers](Assets/MSMExamples/Scenes/LayeredBlockers.unity) | Overlapping shadows from blockers at different heights, with isolated references for examining occluder-fusion artifacts. |
+| [WidePenumbraBenchmark](Assets/MSMExamples/Scenes/WidePenumbraBenchmark.unity) | A screen-filling receiver beneath a slatted canopy for measuring SAT construction versus per-pixel soft-shadow filtering across output resolutions. |
 
 The example cameras use the active pipeline's default renderer. Opening a scene
 does not change pipeline or Quality settings.
