@@ -386,6 +386,38 @@ float4 IntegrateSATRectangle(float2 lo, float2 hi)
     return integral;
 }
 
+float SampleBilinearPCF(float2 texelPosition, float receiverDepth, float depthBias,
+    float2 cascadeMin, float2 cascadeMax)
+{
+    // Texel centers are at n + 0.5.
+    float2 position = texelPosition - 0.5;
+    int2 basePixel = int2(floor(position));
+    float2 fraction = frac(position);
+    float visibility = 0.0;
+
+    [unroll]
+    for (int y = 0; y < 2; ++y)
+    {
+        [unroll]
+        for (int x = 0; x < 2; ++x)
+        {
+            int2 pixel = clamp(basePixel + int2(x, y),
+                int2(cascadeMin), int2(cascadeMax) - 1);
+            float sampleDepth = _ShadowDepth.Load(int3(pixel, 0));
+            #if UNITY_REVERSED_Z
+            sampleDepth = 1.0 - sampleDepth;
+            #endif
+            sampleDepth = sampleDepth * 2.0 - 1.0;
+
+            float wx = x == 0 ? 1.0 - fraction.x : fraction.x;
+            float wy = y == 0 ? 1.0 - fraction.y : fraction.y;
+            float lit = receiverDepth - depthBias <= sampleDepth ? 1.0 : 0.0;
+            visibility += lit * wx * wy;
+        }
+    }
+    return visibility;
+}
+
 [numthreads(8, 8, 1)]
 void CSResolveShadows(uint3 id : SV_DispatchThreadID)
 {
@@ -448,8 +480,8 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     float4 filteredMoments = integral / MOMENT_QUANTIZATION_SCALE / area;
     filteredMoments = filteredMoments * 2.0 - 1.0;
 
-    static const float momentBias = 3e-5;
-    static const float depthBias = 1e-4;
+    static const float momentBias = 7e-4; // Bias to avoid negative variance in moment reconstruction.
+    static const float depthBias = 1e-5;
 
     // First query: estimate blocker depth.
     float averageBlockerDepth = EstimateAverageBlockerDepth(filteredMoments, depth, momentBias);
@@ -465,6 +497,20 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
 
     float worldRadius = worldGap * LIGHT_ANGULAR_SLOPE;
     float2 filterRadius = worldRadius * uvPerWorldUnit * atlasSize;
+
+    // Keep subtexel penumbras on PCF; blend to MSM over a 1-2 texel radius.
+    float radiusTexels = max(filterRadius.x, filterRadius.y);
+    float msmWeight = smoothstep(1.0, 2.0, radiusTexels);
+    float pcfVisibility = 0.0;
+    if (msmWeight < 1.0)
+    {
+        pcfVisibility = SampleBilinearPCF(texelPosition, depth, depthBias, cascadeMin, cascadeMax);
+        if (msmWeight <= 0.0)
+        {
+            _ShadowVisibility[id.xy] = pcfVisibility;
+            return;
+        }
+    }
 
     filterRadius = clamp(filterRadius, MIN_FILTER_RADIUS_TEXELS, MAX_FILTER_RADIUS_TEXELS);
     lo = clamp(texelPosition - filterRadius, cascadeMin, cascadeMax);
@@ -483,7 +529,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     filteredMoments = filteredMoments * 2.0 - 1.0;
 
     float visibility = ComputeMSMHamburger(filteredMoments, depth, depthBias, momentBias);
-    _ShadowVisibility[id.xy] = visibility;
+    _ShadowVisibility[id.xy] = lerp(pcfVisibility, visibility, msmWeight);
 }
 
 [numthreads(8, 8, 1)]

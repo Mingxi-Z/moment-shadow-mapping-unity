@@ -102,6 +102,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             public ComputeShader shader;
             public int kernel;
             public TextureHandle cameraDepthTexture;
+            public TextureHandle shadowDepthTexture;
             public TextureHandle satTexture;
             public TextureHandle output;
             public Matrix4x4 view;
@@ -264,7 +265,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             var visibilityDesc = new TextureDesc(cameraDesc.width, cameraDesc.height)
             {
                 name = "Shadow Visibility",
-                colorFormat = GraphicsFormat.R8_UNorm,
+                colorFormat = GraphicsFormat.R16_SFloat,
                 enableRandomWrite = true,
                 clearBuffer = false
             };
@@ -276,6 +277,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                 data.fixedVisibility = fixedVisibility;
                 data.kernel = data.shader.FindKernel(fixedVisibility ? "CSBenchmarkVisibility" : "CSResolveShadows");
                 data.cameraDepthTexture = resources.cameraDepthTexture;
+                data.shadowDepthTexture = shadowTexture;
                 data.satTexture = satTexture;
                 data.output = visibility;
                 data.view = cameraData.GetViewMatrix();
@@ -302,6 +304,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
 
                         context.cmd.SetComputeMatrixParam(data.shader, "_CameraInverseVP", inverseVP);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_SATInput", data.satTexture);
+                        context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowDepth", data.shadowDepthTexture);
                     }
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowVisibility", data.output);
                     context.cmd.DispatchCompute(data.shader, data.kernel, data.groupsX, data.groupsY, 1);
