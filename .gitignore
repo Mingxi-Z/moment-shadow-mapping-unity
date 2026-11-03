@@ -11,3 +11,6 @@
 !/Assets/MSM/MsmRendererFeature.cs.meta
 !/Assets/MSM/ShadowMoments.compute
 !/Assets/MSM/ShadowMoments.compute.meta
+!/Assets/MSMExamples.meta
+!/Assets/MSMExamples/
+!/Assets/MSMExamples/**
