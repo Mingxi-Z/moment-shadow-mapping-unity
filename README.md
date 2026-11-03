@@ -1,121 +1,202 @@
-# Unity URP Moment Shadow Mapping
+# Moment Soft Shadows for Unity URP
 
-Source-only learning implementation of four-moment shadow mapping with an integer
-summed-area table (SAT). Tested environment: Unity **6000.6.7f1**, URP **17.6.0**,
-macOS / Metal. This is an experimental baseline, not a production shadow package.
+A real-time soft-shadow rendering project built on Unity's Universal Render
+Pipeline. It combines four-moment shadow mapping, an integer summed-area table
+(SAT), and blocker-depth estimation to produce contact-hardening shadows for the
+main directional light.
 
-## Repository scope
+The project explores the trade-offs between shadow quality, numerical precision,
+GPU memory traffic, and temporal stability. A near-contact PCF fallback preserves
+a sharper depth-comparison result where the estimated penumbra is small.
 
-Tracked files are limited to the renderer feature, compute shader, their Unity
-metadata and this README. Scenes, renderer/pipeline assets,
-materials, third-party plugins, project settings, generated files and GPU captures
-remain local and are ignored by an explicit allowlist.
-When adding a new algorithm source file, add its path and metadata to the
-allowlist deliberately; new Unity assets are ignored by default.
+**Status:** Functional rendering prototype. Temporal stability and near-contact
+quality remain under evaluation.
 
-This checkout is **not a complete Unity project**. Create a compatible URP project
-or import the source into an existing one. The current lab's untracked files are not part of this source-only repository.
+## Features
 
-## Integration
+- **Contact-hardening soft shadows** — estimates average blocker depth and adapts
+  the filter radius to the receiver–blocker separation.
+- **Four-moment reconstruction** — uses Hamburger MSM to estimate visibility
+  from filtered depth moments.
+- **Integer SAT filtering** — supports variable-size rectangular queries with
+  fractional texel coverage and bounded modular arithmetic.
+- **Tiled GPU construction** — builds the SAT through local scans and boundary
+  propagation, avoiding a full-resolution intermediate moment texture.
+- **Near-contact PCF fallback** — uses bilinear PCF for small penumbras and blends
+  smoothly into MSM as the estimated radius increases.
+- **Cascade-aware sampling** — selects URP's main-light cascade and clips query
+  regions to its atlas slice.
+- **URP integration** — provides opaque main-light visibility through the
+  screen-space shadow texture using a Renderer Feature and Render Graph.
 
-1. Copy `Assets/MSM` and `Assets/MSM.meta` into a compatible URP project.
-   Only the two tracked source assets are required; do not copy local ignored
-   debug files. Preserve the tracked `.meta` GUIDs. Remove an older copy using
-   the same GUID before importing this one.
-2. Add **MsmRendererFeature** to the active Universal Renderer Data asset.
-3. Assign `ShadowMoments.compute` to its Compute Shader field and select
-   **Full MSM**.
-4. Start with a Forward/Forward+ renderer, one realtime directional light,
-   one cascade initially, and a simple opaque URP Lit receiver/caster setup.
-   The feature requests camera depth and restores the main-light shadow keywords
-   before transparents.
+## Rendering Pipeline
 
-The feature file was renamed from `ShadowTest.cs`; its GUID and serialized
-`momentsSettings` field were preserved for the existing lab renderer.
-The old grayscale debug feature is not included in this repository.
+```text
+URP main-light shadow depth
+    ↓
+Tiled moment encoding and integer SAT construction
+    ↓
+Camera-depth reconstruction and cascade selection
+    ↓
+SAT blocker-depth estimation
+    ↓
+World-space separation → filter radius in shadow texels
+    ↓
+Near contact: bilinear PCF
+Transition:   PCF / MSM blend
+Wider region: filtered SAT moments → MSM reconstruction
+    ↓
+Screen-space visibility → URP opaque lighting
+```
 
-## Data path
+### Tiled SAT Construction
 
-Shadow depth → quantized four moments → tiled uint4 SAT → screen-space MSM
-visibility → URP opaque main-light shadow sampling.
+The compute shader processes 16 × 16 tiles in four stages:
 
-- S.1 `BuildTileSummaries`: local column tails and 2D right-edge summaries.
-- S.2 `CompleteTileColumns`: propagate column summaries; reduce strip totals.
-- S.3 `CompleteTileRows`: propagate complete left boundaries, including above strips.
-- S.4 `BuildTileSAT`: reconstruct the full SAT from depth, top and left contributions.
+| Stage | Kernel | Purpose |
+| --- | --- | --- |
+| S.1 | `BuildTileSummaries` | Compute local column tails and right-edge prefix summaries. |
+| S.2 | `CompleteTileColumns` | Propagate column summaries and compute strip totals. |
+| S.3 | `CompleteTileRows` | Complete left-boundary prefixes across tiles and strips. |
+| S.4 | `BuildTileSAT` | Reconstruct the full SAT from local depth and completed boundaries. |
 
-Tiles are 16×16. S.1/S.4 use 64 cooperative I/O threads and shared local scans.
-S.2 batches eight boundaries; S.4 caches the left edge. S.1 and S.4 recompute
-moments directly from depth instead of storing a full moments intermediate.
+S.1 and S.4 generate quantized moments directly from depth. Cooperative I/O,
+batched boundary processing, and shared left-edge caching reduce intermediate
+storage and repeated memory access.
 
-Each uint4 channel is an independent moment. Prefixes wrap modulo 2^32.
-The quantization scale assumes each integer rectangle queried contains at most
-**256 texels**. Do not enlarge search/filter windows without revisiting this
-bound, including the integer rectangles used by fractional-coverage integration.
+Each SAT texel contains four unsigned 32-bit channels. Prefix sums wrap modulo
+2³²; rectangle queries recover the correct sum within the supported query bound.
+The current quantization scale supports at most **256 source texels per integer
+rectangle**. Larger search or filter windows require revisiting this precision
+budget.
 
-Resolve reconstructs world position from camera depth and transforms to light
-shadow coordinates. A first SAT query supplies moments for average blocker-depth
-estimation. The receiver/blocker gap determines a directional-light penumbra
-radius. A second query supplies filtered moments for Hamburger MSM visibility.
-Both queries reuse the same SAT. Resolve keeps background early-out, streamed
-SAT integration and R8 visibility. Moment bias is 3e-5; receiver depth bias is 1e-4.
+### Shadow Resolve
 
-Shader constants currently use a 7.5-texel blocker-search radius, a filter-radius
-range of 0.5–7.5 texels, and an angular slope of 0.05 (tan of the emitter half-angle).
-The matrix row scales convert signed depth differences to world distances and
-world radii to atlas texels. This assumes orthographic directional-light
-projections. Increasing the angular slope simulates a larger light, not higher quality.
-Blocker estimation rejects non-finite nodes, near-zero weight denominators and
-non-finite averages by returning receiver depth, selecting minimum filtering.
+A first SAT query estimates average blocker depth. For the directional light's
+orthographic projection, the receiver–blocker depth difference is converted to a
+world-space separation and then to a filter radius in atlas texels.
 
-## Benchmark modes
+The estimated radius selects the visibility path before radius clamping:
 
-| Mode | Work before fixed/actual visibility |
+- **Up to 1 texel:** bilinear PCF; skip final MSM reconstruction.
+- **Between 1 and 2 texels:** smooth transition from PCF to MSM.
+- **2 texels and above:** MSM using a second SAT query.
+
+These thresholds refer to radius, not full penumbra width. Both SAT queries and
+the PCF samples stay within the selected cascade slice. Fractional SAT queries
+weight partial texel coverage without interpolating wrapped integer prefixes.
+
+## Requirements
+
+Development environment:
+
+- Unity **6000.6.7f1**
+- Universal Render Pipeline **17.6.0**
+- macOS / Metal
+- Forward or Forward+ rendering with compute-shader support
+
+Other Unity versions, graphics APIs, and player-build configurations have not
+been fully validated.
+
+## Setup
+
+This repository contains rendering source and example assets, not a complete
+Unity project or an installable UPM package.
+
+1. Create or open a compatible URP project.
+2. Copy the tracked files under `Assets/MSM`, including their `.meta` files,
+   into the project. Preserve the supplied GUIDs and avoid duplicate imports.
+3. Add **MsmRendererFeature** to the active Universal Renderer Data asset.
+4. Assign **ShadowMoments.compute** and select **Full MSM**.
+5. Use a realtime main directional light and opaque URP Lit materials. Start
+   with one shadow cascade for a baseline comparison.
+6. Optionally import `Assets/MSMExamples` and its metadata.
+
+Camera depth is requested by the feature. Main-light shadow keywords are
+restored before transparent rendering; transparent receivers retain URP's
+standard shadow path.
+
+## Example Scenes
+
+| Scene | Demonstrates |
 | --- | --- |
-| Full MSM | Tiled SAT and actual MSM Resolve |
-| A Constant | Fixed visibility 0.5 |
-| B Moments | Standalone moments generation, then visibility 0.5 |
-| C Moments And SAT | Tiled SAT, then visibility 0.5 |
+| [ContactHardening](Assets/MSMExamples/Scenes/ContactHardening.unity) | A vertically animated sphere and grounded reference cube for inspecting the relationship between separation and shadow softness. |
+| [LayeredBlockers](Assets/MSMExamples/Scenes/LayeredBlockers.unity) | Overlapping shadows from blockers at different heights, with isolated references for examining occluder-fusion artifacts. |
 
-B and C have different producer paths; subtracting their whole-frame times does
-not isolate a pure SAT dispatch cost. Compare per-dispatch GPU timings with the
-same scene/settings and repeat baseline/variant/baseline. Encoder labels may
-contain more than one dispatch. No portable performance guarantee is claimed.
+The example cameras use the active pipeline's default renderer. Opening a scene
+does not change pipeline or Quality settings.
 
-## Current limits and validation
+In Play mode, disable **Animate** on the sphere's **Demo Sphere Motion**
+component and adjust **Height** for a fixed-pose comparison. See the
+[example guide](Assets/MSMExamples/README.md) for scene controls.
 
-- The main directional light supports cascade-aware sampling using URP's keyword,
-  split spheres and matrices. Both SAT queries are clipped to the selected slice
-  using the installed URP's 1–4 cascade atlas layout. Point/spot lights are absent.
-- Cascade selection switches directly between slices; transition blending is not
-  implemented. The learner reports a soft/hard discontinuity also seen with default
-  URP shadows. Its exact location has not been matched to cascade debug colors.
-- Basic contact hardening is implemented. The learner reports softer edges as a
-  caster moves away from the receiver in the lab scene. This is a visual check,
-  not validation across arbitrary depth distributions or scenes.
-- Search/filter radii are capped for integer precision; large penumbrae are
-  truncated. The search is fixed in texels, not a general physical search bound.
-- The final Hamburger visibility reconstruction still has unguarded degenerate
-  divisions. Blocker fallbacks do not make every reconstruction numerically robust.
-- Transparent receivers retain URP's original shadow route.
-- Multi-camera/XR/portal rendering, mixed/baked-lighting parity, player-build
-  shader stripping and complete shadow-distance/fade behavior are not validated.
-- The implementation depends on the installed URP shader/API conventions;
-  re-check projection orientation and depth conventions when changing versions.
+## Current Progress
 
-In the lab, increasing the angular slope exposed a gray outer contour. A fixed
-filter removed it; increasing the search radius from 4 to 7.5 also removed it with
-dynamic filtering restored. This supports insufficient search coverage as a
-contributor, not a universal proof that search radius equals maximum filter radius.
-Scene-view wheel zoom shows edge stepping in both this feature and default URP
-shadows; the exact screen-sampling/projection contribution remains unisolated.
+Implemented:
+
+- Directional-light MSM and integer tiled SAT construction.
+- Fractional-coverage filtering and average blocker-depth estimation.
+- Contact-hardening radius estimation.
+- Cascade selection and atlas-slice isolation.
+- Near-contact PCF fallback and smooth PCF/MSM blending.
+- Example scenes.
+
+Current focus:
+
+- Evaluate contact quality and temporal stability of the hybrid visibility path.
+- Separate source shadow-map aliasing from moment-reconstruction artifacts.
+- Balance numerical bias against near-contact light leaking.
+
+Not implemented:
+
+- Cascade-transition blending.
+- Point-light and spot-light MSM.
+- Spatial denoising or temporal accumulation.
+
+## Limitations
+
+- Moment reconstruction can leak light, particularly near contact and with
+  complex depth distributions. Averaging multiple blockers into one depth can
+  produce incorrect softness for layered occluders.
+- Filter and search radii are capped by the integer precision budget. The search
+  region is fixed in texel space, and large penumbras are truncated.
+- The near-contact fallback reduces reliance on MSM but cannot eliminate
+  aliasing already present in the source shadow map.
+- Cascade transitions are not blended and may remain visible.
+- Final moment reconstruction is sensitive to degenerate inputs and numerical
+  precision. Current bias values are experimental.
+- XR, multi-camera rendering, mixed/baked-lighting parity, build-time shader
+  stripping, and cross-platform behavior require further validation.
+
+## Performance Analysis
+
+The Renderer Feature includes diagnostic modes:
+
+| Mode | Work performed |
+| --- | --- |
+| Full MSM | Tiled SAT construction and hybrid PCF/MSM resolve. |
+| A Constant | Fixed visibility of 0.5. |
+| B Moments | Standalone moment generation and fixed visibility of 0.5. |
+| C Moments And SAT | Tiled SAT construction and fixed visibility of 0.5. |
+
+B and C use different producer paths, so their whole-frame difference is not an
+isolated SAT construction cost. Compare per-dispatch GPU timings under identical
+scene, resolution, cascade, and lighting settings. Performance results are
+hardware- and configuration-dependent.
+
+## Repository Layout
+
+```text
+Assets/
+  MSM/                 Renderer Feature and compute shader
+  MSMExamples/         Demonstration scenes, materials, and animation
+```
+
+Unity metadata is included. Generated files, local pipeline settings, third-party
+comparison plugins, and GPU captures are excluded from version control.
 
 ## References
 
-- Peters et al., [Improved Moment Shadow Maps for Translucent Occluders,
-  Soft Shadows and Single Scattering](https://jcgt.org/published/0006/01/03/), 2017.
-- Nehab et al., [GPU-efficient recursive filtering and summed-area tables](https://hhoppe.com/proj/recursive/), 2011.
-
-This is a learning implementation with AI assistance. These references describe
-the algorithms; this repository does not claim to reproduce the authors' exact
-code, hardware configuration or timings.
+- Peters et al., [Moment Shadow Mapping](https://momentsingraphics.de/I3D2015.html), 2015.
+- Peters et al., [Improved Moment Shadow Maps](https://jcgt.org/published/0006/01/03/), 2017.
+- Nehab et al., [GPU-efficient Recursive Filtering and Summed-Area Tables](https://hhoppe.com/proj/recursive/), 2011.
