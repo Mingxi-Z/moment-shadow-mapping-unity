@@ -36,7 +36,7 @@ static const float MOMENT_QUANTIZATION_SCALE = float(0xffffffffu / MAX_SAT_QUERY
 static const float MAX_FILTER_RADIUS_TEXELS = 7.5;
 static const float BLOCKER_SEARCH_RADIUS_TEXELS = MAX_FILTER_RADIUS_TEXELS;
 static const float MIN_FILTER_RADIUS_TEXELS = 0.5;
-static const float LIGHT_ANGULAR_SLOPE = 0.05; // tan(emitter half-angle).
+float _LightAngularSlope;
 
 float4 EncodeMoments(float z)
 {
@@ -495,7 +495,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     // Moments use [-1,1]; the shadow matrix depth uses [0,1].
     float worldGap = signedDepthGap / (2.0 * depthPerWorldUnit);
 
-    float worldRadius = worldGap * LIGHT_ANGULAR_SLOPE;
+    float worldRadius = worldGap * _LightAngularSlope;
     float2 filterRadius = worldRadius * uvPerWorldUnit * atlasSize;
 
     // Keep subtexel penumbras on PCF; blend to MSM over a 1-2 texel radius.

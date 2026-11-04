@@ -61,6 +61,8 @@ public class MsmRendererFeature : ScriptableRendererFeature
         public ComputeShader computeShader;
         [Tooltip("Temporary A/B/C comparison. All benchmark modes output visibility 0.5.")]
         public BenchmarkMode benchmarkMode = BenchmarkMode.FullMSM;
+        [Tooltip("Full angular diameter of the directional light, in degrees.")]
+        [Range(0.0f, 20.0f)] public float lightAngularDiameter = 5.72481f;
     }
 
     private class MsmRenderPass : ScriptableRenderPass
@@ -98,6 +100,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
 
         private class ResolvePassData
         {
+            public float lightAngularSlope;
             public bool fixedVisibility;
             public ComputeShader shader;
             public int kernel;
@@ -275,6 +278,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             {
                 data.shader = settings.computeShader;
                 data.fixedVisibility = fixedVisibility;
+                data.lightAngularSlope = Mathf.Tan(0.5f * Mathf.Clamp(settings.lightAngularDiameter, 0.0f, 20.0f) * Mathf.Deg2Rad);
                 data.kernel = data.shader.FindKernel(fixedVisibility ? "CSBenchmarkVisibility" : "CSResolveShadows");
                 data.cameraDepthTexture = resources.cameraDepthTexture;
                 data.shadowDepthTexture = shadowTexture;
@@ -303,6 +307,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                         Matrix4x4 inverseVP = (gpuProjection * data.view).inverse;
 
                         context.cmd.SetComputeMatrixParam(data.shader, "_CameraInverseVP", inverseVP);
+                        context.cmd.SetComputeFloatParam(data.shader, "_LightAngularSlope", data.lightAngularSlope);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_SATInput", data.satTexture);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowDepth", data.shadowDepthTexture);
                     }
