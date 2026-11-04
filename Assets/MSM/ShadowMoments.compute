@@ -30,13 +30,35 @@ groupshared uint4 tileShared[SAT_TILE_SIZE * SAT_TILE_SIZE];
 groupshared uint4 tileBoundaryShared[SAT_BOUNDARY_BATCH * SAT_TILE_SIZE];
 groupshared uint4 tileLeftShared[SAT_TILE_SIZE];
 
-static const uint MAX_SAT_QUERY_TEXELS = 256u;
-static const float MOMENT_QUANTIZATION_SCALE = float(0xffffffffu / MAX_SAT_QUERY_TEXELS);
-// Fractional windows touch at most 16x16 texels at this radius.
-static const float MAX_FILTER_RADIUS_TEXELS = 7.5;
-static const float BLOCKER_SEARCH_RADIUS_TEXELS = MAX_FILTER_RADIUS_TEXELS;
-static const float MIN_FILTER_RADIUS_TEXELS = 0.5;
+float _MaxQueryRadiusWorld;
 float _LightAngularSlope;
+static const float MIN_FILTER_RADIUS_TEXELS = 0.5;
+
+float QueryQuantizationScale(float radiusTexels, uint width, uint height)
+{
+    // One extra texel beyond fractional support covers float boundary rounding.
+    uint support = (uint)max(16.0, ceil(2.0 * radiusTexels) + 2.0);
+    return float(min(16777215u, 0xffffffffu / (min(support, width) * min(support, height))));
+}
+
+float CalculateMomentQuantizationScale(uint width, uint height)
+{
+    float maxDensity = 0.0;
+    #if defined(_MAIN_LIGHT_SHADOWS_CASCADE)
+        const uint matrixCount = 4;
+    #else
+        const uint matrixCount = 1;
+    #endif
+    [unroll]
+    for (uint i = 0; i < matrixCount; ++i)
+    {
+        float4x4 m = _MainLightWorldToShadow[i];
+        maxDensity = max(maxDensity, max(length(m[0].xyz) * width, length(m[1].xyz) * height));
+    }
+    // Queries are clipped to atlas slices, so support never exceeds the atlas.
+    float radiusTexels = min(_MaxQueryRadiusWorld * maxDensity, float(max(width, height)));
+    return QueryQuantizationScale(radiusTexels, width, height);
+}
 
 float4 EncodeMoments(float z)
 {
@@ -45,14 +67,14 @@ float4 EncodeMoments(float z)
     return saturate(moments * 0.5 + 0.5);
 }
 
-uint4 LoadQuantizedMoments(uint2 pixel)
+uint4 LoadQuantizedMoments(uint2 pixel, float quantizationScale)
 {
     float z = _ShadowDepth.Load(int3(pixel, 0));
     #if UNITY_REVERSED_Z
     z = 1.0 - z;
     #endif
     z = z * 2.0 - 1.0;
-    return uint4(round(EncodeMoments(z) * MOMENT_QUANTIZATION_SCALE));
+    return uint4(round(EncodeMoments(z) * quantizationScale));
 }
 
 [numthreads(8, 8, 1)]
@@ -63,7 +85,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (id.x >= width || id.y >= height)
         return;
 
-    _MomentsOutput[id.xy] = LoadQuantizedMoments(id.xy);
+    _MomentsOutput[id.xy] = LoadQuantizedMoments(id.xy, CalculateMomentQuantizationScale(width, height));
 }
 
 [numthreads(64, 1, 1)]
@@ -71,6 +93,7 @@ void BuildTileSummaries(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
 {
     uint width, height;
     _ShadowDepth.GetDimensions(width, height);
+    float quantizationScale = CalculateMomentQuantizationScale(width, height);
     uint2 origin = group.xy * SAT_TILE_SIZE;
     [unroll]
     for (uint index = lane; index < SAT_TILE_SIZE * SAT_TILE_SIZE; index += 64)
@@ -78,7 +101,7 @@ void BuildTileSummaries(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
         uint2 pixel = origin + uint2(index % SAT_TILE_SIZE, index / SAT_TILE_SIZE);
         uint4 value = 0;
         if (pixel.x < width && pixel.y < height)
-            value = LoadQuantizedMoments(pixel);
+            value = LoadQuantizedMoments(pixel, quantizationScale);
         tileShared[index] = value;
     }
     GroupMemoryBarrierWithGroupSync();
@@ -174,6 +197,7 @@ void BuildTileSAT(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
 {
     uint width, height;
     _ShadowDepth.GetDimensions(width, height);
+    float quantizationScale = CalculateMomentQuantizationScale(width, height);
     uint2 origin = group.xy * SAT_TILE_SIZE;
 
     [unroll]
@@ -184,7 +208,7 @@ void BuildTileSAT(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
         uint4 value = 0;
         if (pixel.x < width && pixel.y < height)
         {
-            value = LoadQuantizedMoments(pixel);
+            value = LoadQuantizedMoments(pixel, quantizationScale);
             if (local.y == 0 && group.y > 0)
                 value += _TileColumnsInput.Load(int3(pixel.x, group.y - 1, 0));
         }
@@ -466,8 +490,13 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
         float2 cascadeMax = atlasSize;
     #endif
 
-    float2 lo = clamp(texelPosition - BLOCKER_SEARCH_RADIUS_TEXELS, cascadeMin, cascadeMax);
-    float2 hi = clamp(texelPosition + BLOCKER_SEARCH_RADIUS_TEXELS, cascadeMin, cascadeMax);
+    float4x4 worldToShadow = _MainLightWorldToShadow[cascadeIndex];
+    float depthPerWorldUnit = length(worldToShadow[2].xyz);
+    float2 uvPerWorldUnit = float2(length(worldToShadow[0].xyz), length(worldToShadow[1].xyz));
+    float quantizationScale = CalculateMomentQuantizationScale(shadowWidth, shadowHeight);
+    float2 searchRadius = _MaxQueryRadiusWorld * uvPerWorldUnit * atlasSize;
+    float2 lo = clamp(texelPosition - searchRadius, cascadeMin, cascadeMax);
+    float2 hi = clamp(texelPosition + searchRadius, cascadeMin, cascadeMax);
     float2 extent = hi - lo;
     float area = extent.x * extent.y;
     if (area <= 0.0)
@@ -477,7 +506,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     }
 
     float4 integral = IntegrateSATRectangle(lo, hi);
-    float4 filteredMoments = integral / MOMENT_QUANTIZATION_SCALE / area;
+    float4 filteredMoments = integral / quantizationScale / area;
     filteredMoments = filteredMoments * 2.0 - 1.0;
 
     static const float momentBias = 7e-4; // Bias to avoid negative variance in moment reconstruction.
@@ -486,16 +515,11 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     // First query: estimate blocker depth.
     float averageBlockerDepth = EstimateAverageBlockerDepth(filteredMoments, depth, momentBias);
 
-    float4x4 worldToShadow = _MainLightWorldToShadow[cascadeIndex];
-
-    float depthPerWorldUnit = length(worldToShadow[2].xyz);
-    float2 uvPerWorldUnit = float2(length(worldToShadow[0].xyz), length(worldToShadow[1].xyz));
-
     float signedDepthGap = max(depth - averageBlockerDepth, 0.0);
     // Moments use [-1,1]; the shadow matrix depth uses [0,1].
     float worldGap = signedDepthGap / (2.0 * depthPerWorldUnit);
 
-    float worldRadius = worldGap * _LightAngularSlope;
+    float worldRadius = min(worldGap * _LightAngularSlope, _MaxQueryRadiusWorld);
     float2 filterRadius = worldRadius * uvPerWorldUnit * atlasSize;
 
     // Keep subtexel penumbras on PCF; blend to MSM over a 1-2 texel radius.
@@ -512,7 +536,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    filterRadius = clamp(filterRadius, MIN_FILTER_RADIUS_TEXELS, MAX_FILTER_RADIUS_TEXELS);
+    filterRadius = max(filterRadius, MIN_FILTER_RADIUS_TEXELS);
     lo = clamp(texelPosition - filterRadius, cascadeMin, cascadeMax);
     hi = clamp(texelPosition + filterRadius, cascadeMin, cascadeMax);
     extent = hi - lo;
@@ -525,7 +549,7 @@ void CSResolveShadows(uint3 id : SV_DispatchThreadID)
     }
 
     integral = IntegrateSATRectangle(lo, hi);
-    filteredMoments = integral / MOMENT_QUANTIZATION_SCALE / area;
+    filteredMoments = integral / quantizationScale / area;
     filteredMoments = filteredMoments * 2.0 - 1.0;
 
     float visibility = ComputeMSMHamburger(filteredMoments, depth, depthBias, momentBias);

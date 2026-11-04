@@ -63,6 +63,8 @@ public class MsmRendererFeature : ScriptableRendererFeature
         public BenchmarkMode benchmarkMode = BenchmarkMode.FullMSM;
         [Tooltip("Full angular diameter of the directional light, in degrees.")]
         [Range(0.0f, 20.0f)] public float lightAngularDiameter = 5.72481f;
+        [Tooltip("Maximum blocker-search and penumbra radius in world units (meters at unit scale). Larger ranges reduce integer moment precision.")]
+        [Range(0.01f, 1.0f)] public float maxQueryRadiusWorld = 0.5f;
     }
 
     private class MsmRenderPass : ScriptableRenderPass
@@ -77,6 +79,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
 
         private class MomentsPassData
         {
+            public float maxQueryRadiusWorld;
             public ComputeShader shader;
             public int kernel;
             public TextureHandle input;
@@ -87,6 +90,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
 
         private class TilePassData
         {
+            public float maxQueryRadiusWorld;
             public ComputeShader shader;
             public int kernel;
             public TextureHandle input;
@@ -100,6 +104,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
 
         private class ResolvePassData
         {
+            public float maxQueryRadiusWorld;
             public float lightAngularSlope;
             public bool fixedVisibility;
             public ComputeShader shader;
@@ -126,7 +131,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
         }
 
         // S.1 and S.4 recompute moments to avoid a full intermediate texture.
-        TextureHandle RecordTiledSAT(RenderGraph graph, TextureHandle shadowDepth)
+        TextureHandle RecordTiledSAT(RenderGraph graph, TextureHandle shadowDepth, float maxQueryRadiusWorld)
         {
             const int tileSize = 16;
             var desc = graph.GetTextureDesc(shadowDepth);
@@ -141,6 +146,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             {
                 data.shader = settings.computeShader;
                 data.kernel = data.shader.FindKernel("BuildTileSummaries");
+                data.maxQueryRadiusWorld = maxQueryRadiusWorld;
                 data.input = shadowDepth;
                 data.rows = rows;
                 data.columns = columns;
@@ -155,6 +161,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowDepth", data.input);
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_TileRowsOutput", data.rows);
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_TileColumnsOutput", data.columns);
+                    context.cmd.SetComputeFloatParam(data.shader, "_MaxQueryRadiusWorld", data.maxQueryRadiusWorld);
                     context.cmd.DispatchCompute(data.shader, data.kernel, data.groupsX, data.groupsY, 1);
                 });
             }
@@ -199,6 +206,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             {
                 data.shader = settings.computeShader;
                 data.kernel = data.shader.FindKernel("BuildTileSAT");
+                data.maxQueryRadiusWorld = maxQueryRadiusWorld;
                 data.input = shadowDepth;
                 data.output = result;
                 data.rows = rows;
@@ -216,6 +224,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_TileRowsInput", data.rows);
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_TileColumnsInput", data.columns);
                     context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_TileOutput", data.output);
+                    context.cmd.SetComputeFloatParam(data.shader, "_MaxQueryRadiusWorld", data.maxQueryRadiusWorld);
                     context.cmd.DispatchCompute(data.shader, data.kernel, data.groupsX, data.groupsY, 1);
                 });
             }
@@ -232,11 +241,12 @@ public class MsmRendererFeature : ScriptableRendererFeature
             if (!shadowTexture.IsValid())
                 return;
 
+            float maxQueryRadiusWorld = Mathf.Clamp(settings.maxQueryRadiusWorld, 0.01f, 1.0f);
             TextureHandle satTexture = default;
             if (settings.benchmarkMode == BenchmarkMode.FullMSM
                 || settings.benchmarkMode == BenchmarkMode.CMomentsAndSAT)
             {
-                satTexture = RecordTiledSAT(renderGraph, shadowTexture);
+                satTexture = RecordTiledSAT(renderGraph, shadowTexture, maxQueryRadiusWorld);
             }
             else if (settings.benchmarkMode == BenchmarkMode.BMoments)
             {
@@ -246,6 +256,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                 {
                     data.shader = settings.computeShader;
                     data.kernel = data.shader.FindKernel("CSMain");
+                    data.maxQueryRadiusWorld = maxQueryRadiusWorld;
                     data.input = shadowTexture;
                     data.output = moments;
                     data.groupsX = (inputDesc.width + 7) / 8;
@@ -257,6 +268,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                     {
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowDepth", data.input);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_MomentsOutput", data.output, 0);
+                        context.cmd.SetComputeFloatParam(data.shader, "_MaxQueryRadiusWorld", data.maxQueryRadiusWorld);
                         context.cmd.DispatchCompute(data.shader, data.kernel, data.groupsX, data.groupsY, 1);
                     });
                 }
@@ -278,6 +290,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
             {
                 data.shader = settings.computeShader;
                 data.fixedVisibility = fixedVisibility;
+                data.maxQueryRadiusWorld = maxQueryRadiusWorld;
                 data.lightAngularSlope = Mathf.Tan(0.5f * Mathf.Clamp(settings.lightAngularDiameter, 0.0f, 20.0f) * Mathf.Deg2Rad);
                 data.kernel = data.shader.FindKernel(fixedVisibility ? "CSBenchmarkVisibility" : "CSResolveShadows");
                 data.cameraDepthTexture = resources.cameraDepthTexture;
@@ -307,6 +320,7 @@ public class MsmRendererFeature : ScriptableRendererFeature
                         Matrix4x4 inverseVP = (gpuProjection * data.view).inverse;
 
                         context.cmd.SetComputeMatrixParam(data.shader, "_CameraInverseVP", inverseVP);
+                        context.cmd.SetComputeFloatParam(data.shader, "_MaxQueryRadiusWorld", data.maxQueryRadiusWorld);
                         context.cmd.SetComputeFloatParam(data.shader, "_LightAngularSlope", data.lightAngularSlope);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_SATInput", data.satTexture);
                         context.cmd.SetComputeTextureParam(data.shader, data.kernel, "_ShadowDepth", data.shadowDepthTexture);
