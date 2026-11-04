@@ -34,7 +34,7 @@ Select Animated Sphere and find Demo Sphere Motion in the Inspector:
 - Keep the camera and light fixed when recording. Motion runs only in Play mode.
 
 Compare the sphere's shadow at low and high positions. The cube provides a fixed
-contact reference. The shader's filter-radius cap may limit visible widening;
+contact reference. The world-space query-radius cap may limit visible widening;
 this scene does not raise it or alter moment/depth bias.
 
 ## LayeredBlockers
@@ -75,17 +75,21 @@ is faster. Fixed-sample PCSS does not necessarily get slower with filter radius.
 3. Match the visible softness before comparing speed. In the current local
    PCSS-URP implementation, raw world radius is
    `2 * gap * tan(sunAngularDiameter / 2) * penumbraScale` when `farSoftness = 0`.
-   With MSM's current slope of 0.05, `penumbraScale = 1` and
+   With MSM's default angular diameter of 5.72481 degrees (slope 0.05), `penumbraScale = 1` and
    `sunAngularDiameter = 0.0499896` radians match that radius coefficient.
    This matches the code's radius convention, not a universal light-size setting.
-   Set its blocker-search radius to 7.5 texels and hard/soft threshold to 2 texels
-   for the corresponding initial comparison. PCSS uses a disk and MSM a box,
+   MSM's Max Query Radius World bounds both search and filtering (default 0.5 m).
+   Convert it with the active shadow matrix and atlas dimensions to match PCSS's
+   blocker-search radius in texels; do not reuse an old fixed 7.5-texel setting.
+   Use a PCSS hard/soft threshold of 2 texels for the initial comparison.
+   PCSS uses a disk and MSM a box,
    so matching radius does not make the filter shapes identical.
 4. Inspect actual radius/processing coverage. Confirm much of the floor runs the
    MSM path rather than the near-contact PCF fallback, and that PCSS's mask is
    doing meaningful penumbra work. Do not disable its mask just to produce a win.
-   MSM currently caps radius at 7.5 texels. If that cap is reached, match the
-   PCSS maximum radius too (`7.5 / atlasWidth` in this plugin's UV setting), or
+   MSM caps radius in world units. If that cap is reached, match the
+   PCSS maximum radius too (`worldRadius * length(worldToShadow row 0)` in this
+   plugin's atlas-UV setting), or
    report the mismatch rather than presenting sharper MSM as equivalent quality.
 5. At a fixed atlas size, run 1920x1080, 2560x1440 and 3840x2160. Warm up after
    each change and record repeated GPU measurements, including MSM/PCSS/MSM

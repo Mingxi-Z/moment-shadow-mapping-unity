@@ -66,9 +66,11 @@ storage and repeated memory access.
 
 Each SAT texel contains four unsigned 32-bit channels. Prefix sums wrap modulo
 2³²; rectangle queries recover the correct sum within the supported query bound.
-The current quantization scale supports at most **256 source texels per integer
-rectangle**. Larger search or filter windows require revisiting this precision
-budget.
+The quantization scale is derived from the world-space query cap, the current
+camera's shadow matrices and atlas dimensions. All moment producers and Resolve
+use the same scale. Larger query support reduces moment precision rather than
+silently overflowing local rectangle sums. Very large ranges can therefore
+increase reconstruction noise or light bleeding.
 
 ### Shadow Resolve
 
@@ -76,7 +78,17 @@ A first SAT query estimates average blocker depth. For the directional light's
 orthographic projection, the receiver–blocker depth difference is converted to a
 world-space separation and then to a filter radius in atlas texels.
 
-The estimated radius selects the visibility path before radius clamping:
+The renderer feature exposes **Light Angular Diameter** (full angle in degrees)
+and **Max Query Radius World** (world units; meters at unit scale). The default
+diameter of 5.72481 degrees preserves the previous half-angle tangent of 0.05.
+The maximum-radius slider spans 0.01-1 world units, defaults to 0.5 and bounds both blocker search
+and final filtering. Radius is capped in world space before conversion through
+each cascade's matrix; there is no fixed 7.5-texel cap. This does not add cascade
+blending or remove the existing texel-based PCF/MSM transition below.
+The slider range suits the meter-scale examples; it is not a precision guarantee
+for every camera, cascade layout or shadow resolution.
+
+The estimated radius, after the world-space cap, selects the visibility path:
 
 - **Up to 1 texel:** bilinear PCF; skip final MSM reconstruction.
 - **Between 1 and 2 texels:** smooth transition from PCF to MSM.
